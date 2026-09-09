@@ -32,23 +32,30 @@ function restoreDraftToDom(){for(const [k,v] of Object.entries(draft)){const el=
 async function fetchTimeout(url,opt={},ms=7000){const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),ms);try{return await fetch(url,{...opt,signal:ctrl.signal})}finally{clearTimeout(t)}}
 async function supabaseRpc(name,payload){const r=await fetchTimeout(`${SUPABASE_URL}/rest/v1/rpc/${name}`,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE},body:JSON.stringify(payload)},7000);let d=null;try{d=await r.json()}catch{}if(!r.ok)throw new Error(d?.message||d?.error||`HTTP ${r.status}`);return d}
 async function remoteMission(){
-  let d;
-  try{ d=await supabaseRpc('sivtr_get_mission_v2',{p_token:token,p_mission_id:missionId||null}); }
-  catch(e){ d=await supabaseRpc('sivtr_get_mission',{p_token:token}); }
+  let firstErr=null,d=null;
+  try{d=await supabaseRpc('sivtr_get_mission_v2',{p_token:token,p_mission_id:missionId||null})}
+  catch(e){firstErr=e;try{d=await supabaseRpc('sivtr_get_mission',{p_token:token})}catch(e2){throw firstErr||e2}}
   d=Array.isArray(d)?d[0]:d;
-  if(d?.mobile_token&&d.mobile_token!==token) token=String(d.mobile_token);
+  // O token lido do QR é imutável durante toda a missão. Nunca o substitua por retorno remoto.
   return d;
 }
-async function send(kind,data){
-  if(!navigator.onLine)throw new Error('Sem internet. A ação foi mantida no aparelho.');
+async function send(kind,data,allowQueue=true){
+  if(!navigator.onLine){if(allowQueue){await queue(kind,data);return {ok:true,queuedLocal:true}}throw new Error('Sem internet. Ação aguardando sincronização.')}
   if(externalMode){
     try{return await supabaseRpc('sivtr_enqueue_action_v2',{p_token:token,p_mission_id:missionId||null,p_action_type:kind,p_payload:data||{}})}
-    catch(e){return await supabaseRpc('sivtr_enqueue_action',{p_token:token,p_action_type:kind,p_payload:data||{}})}
+    catch(e1){
+      try{return await supabaseRpc('sivtr_enqueue_action',{p_token:token,p_action_type:kind,p_payload:data||{}})}
+      catch(e2){
+        const msg=String(e2?.message||e1?.message||'Falha de sincronização');
+        if(allowQueue&&/missão não encontrada|mission not found|404|function/i.test(msg)){await queue(kind,data);lastRemoteError='Sincronização pendente; a ação foi preservada neste aparelho.';return {ok:true,queuedLocal:true}}
+        throw e2;
+      }
+    }
   }
   const r=await fetch(`/api/mobile/${encodeURIComponent(token)}/${kind}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});const d=await r.json();if(!r.ok||d.ok===false)throw new Error(d.error||'Falha');return d
 }
 async function queue(kind,data){const item={id:crypto.randomUUID?crypto.randomUUID():Date.now()+'_'+Math.random(),kind,data,at:new Date().toISOString(),token};await put('queue',item);return item}
-async function flushQueue(){if(!navigator.onLine)return;for(const x of (await all('queue')).sort((a,b)=>a.at.localeCompare(b.at))){try{await send(x.kind,x.data);await del('queue',x.id)}catch{break}}}
+async function flushQueue(){if(!navigator.onLine)return;for(const x of (await all('queue')).sort((a,b)=>a.at.localeCompare(b.at))){try{await send(x.kind,x.data,false);await del('queue',x.id)}catch{break}}}
 const vtrLabel=m=>[m.vehicle_code||m.vehicleCode,m.vehicle_type||m.vehicleType,m.fab_register||m.fabRegister].filter(Boolean).join(' - ');
 const statusOf=m=>String(m.status||'').toUpperCase();
 function hero(){return `<div class="card hero"><h1>${esc(mission.mission_number||mission.missionNumber||'MISSÃO')}</h1><span class="status">${esc(mission.status||'SINCRONIZANDO')}</span><div class="grid" style="margin-top:10px"><div class="cell"><small>VTR / TIPO / REG</small><b>${esc(vtrLabel(mission)||'-')}</b></div><div class="cell"><small>MOTORISTA / SARAM</small><b>${esc(mission.driver_display||mission.driver||'-')}${mission.driver_saram||mission.driverSaram?` / ${esc(mission.driver_saram||mission.driverSaram)}`:''}</b></div><div class="cell"><small>DESTINO</small><b>${esc(mission.destination||'-')}</b></div><div class="cell"><small>APRESENTAÇÃO</small><b>${esc(mission.presentation_place||mission.presentationPlace||mission.scheduled_departure||mission.departure||'-')}</b></div><div class="cell"><small>SOLICITANTE / SEÇÃO</small><b>${esc((mission.requester_name||mission.requester||'-')+' / '+(mission.requester_section||mission.section||'-'))}</b></div><div class="cell"><small>MISSÃO</small><b>${esc(mission.mission||'-')}</b></div></div></div>`}
