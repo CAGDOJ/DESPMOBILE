@@ -9,7 +9,7 @@ const qrToken=decodeURIComponent(qs.get('token')||boot?.token||((pathPart&&pathP
 let token=qrToken;
 const missionId=String(boot?.missionId||qs.get('missionId')||'');
 const externalMode=location.hostname.includes('github.io')||location.hostname.endsWith('.supabase.co')||qs.has('token');
-let mission=null,gpsWatch=null,lastGps=0,lastRemoteError='',submittingStart=false,submittingReturn=false,submissionProgress='';
+let mission=null,gpsWatch=null,lastGps=0,lastRemoteError='',submittingStart=false,submittingReturn=false,submissionProgress='',remoteConnected=false,remoteReadBusy=false,flushBusy=false,lastRemoteOk=0;
 const checklistItems=['Extintor','Macaco','Chave de rodas','Estepe','Parte elétrica','Lataria','Óleo lubrificante','Água','Fluido de freio','Pneus','Triângulo','Limpeza','CRLV','Bateria','Pintura','Para-brisas / Vidros'];
 const requiredShots=[{key:'FRENTE',label:'Frente da VTR'},{key:'TRASEIRA',label:'Traseira da VTR'},{key:'LATERAL_ESQUERDA',label:'Lateral esquerda'},{key:'LATERAL_DIREITA',label:'Lateral direita'},{key:'PAINEL',label:'Painel / hodômetro'}];
 const shotState={SAÍDA:{},RETORNO:{}};
@@ -22,8 +22,8 @@ function photoRows(stage){const remote=(Array.isArray(mission?.media)?mission.me
 function photoSummary(stage){const rows=photoRows(stage);if(!rows.length)return '';return `<div class="photo-log"><div class="section-label">Fotos registradas — ${stage}</div>${rows.map(x=>`<div class="photo-log-row"><b>${esc(x.caption||'Foto')}</b><span>Capturada em ${esc(fmtDT(x.event_at))}</span>${x.received_at?`<small>Recebida pelo SIVTR em ${esc(fmtDT(x.received_at))}</small>`:'<small>Aguardando sincronização com o SIVTR central</small>'}</div>`).join('')}</div>`}
 function setSubmitProgress(text){submissionProgress=text||'';const el=document.getElementById('submissionProgress');if(el)el.textContent=submissionProgress}
 
-function updateNet(){net.textContent=navigator.onLine?'ONLINE':'OFFLINE';net.classList.toggle('off',!navigator.onLine)}
-window.addEventListener('online',()=>{updateNet();flushQueue();refresh()});window.addEventListener('offline',updateNet);updateNet();
+function updateNet(){const online=navigator.onLine;if(!online){net.textContent='OFFLINE';net.classList.add('off');return}if(remoteConnected||Date.now()-lastRemoteOk<5000){net.textContent='ONLINE';net.classList.remove('off')}else{net.textContent='SINCRONIZANDO';net.classList.remove('off')}}
+window.addEventListener('online',()=>{updateNet();flushQueue();refresh()});window.addEventListener('offline',()=>{remoteConnected=false;updateNet()});updateNet();
 function ticketFromHash(){return boot||bootTicket()}
 function idb(){return new Promise((resolve,reject)=>{const r=indexedDB.open('sivtr-mobile',5);r.onupgradeneeded=()=>{const d=r.result;if(!d.objectStoreNames.contains('missions'))d.createObjectStore('missions',{keyPath:'token'});if(!d.objectStoreNames.contains('queue'))d.createObjectStore('queue',{keyPath:'id'});if(!d.objectStoreNames.contains('drafts'))d.createObjectStore('drafts',{keyPath:'token'})};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
 async function put(store,val){const d=await idb();return new Promise((res,rej)=>{const t=d.transaction(store,'readwrite');t.objectStore(store).put(val);t.oncomplete=res;t.onerror=()=>rej(t.error)})}
@@ -35,52 +35,51 @@ async function restoreMobileState(){try{const x=await get('drafts',token);if(x){
 function saveDraftField(id,value){draft[id]=value;try{localStorage.setItem(draftKey,JSON.stringify(draft))}catch{}persistMobileState()}
 function bindDraftAutosave(){document.querySelectorAll('input:not([type=file]),textarea,select').forEach(el=>{const key=el.id||el.name;if(!key)return;el.addEventListener(el.type==='radio'||el.type==='checkbox'||el.tagName==='SELECT'?'change':'input',()=>{if(el.type==='radio'){if(el.checked)saveDraftField(key,el.value)}else saveDraftField(key,el.type==='checkbox'?el.checked:el.value)})})}
 function restoreDraftToDom(){for(const [k,v] of Object.entries(draft)){const el=document.getElementById(k);if(el&&el.type!=='file'){if(el.type==='checkbox')el.checked=!!v;else el.value=v}document.querySelectorAll(`input[type=radio][name="${CSS.escape(k)}"]`).forEach(r=>r.checked=r.value===v)};for(const stage of ['SAÍDA','RETORNO'])for(const x of requiredShots){const s=shotState[stage][x.key];if(!s)continue;const p=document.getElementById(`preview_${stage}_${x.key}`),st=document.getElementById(`state_${stage}_${x.key}`);if(p)p.innerHTML=`<img src="${s.dataUrl}" alt="${x.key}">`;if(st){st.textContent='Foto pronta • '+fmtDT(s.capturedAt);st.classList.add('done')}}}
-async function fetchTimeout(url,opt={},ms=7000){const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),ms);try{return await fetch(url,{...opt,signal:ctrl.signal})}finally{clearTimeout(t)}}
-async function supabaseRpc(name,payload){const r=await fetchTimeout(`${SUPABASE_URL}/rest/v1/rpc/${name}`,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE},body:JSON.stringify(payload)},7000);let d=null;try{d=await r.json()}catch{}if(!r.ok)throw new Error(d?.message||d?.error||`HTTP ${r.status}`);return d}
+async function fetchTimeout(url,opt={},ms=12000){const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),ms);try{return await fetch(url,{...opt,signal:ctrl.signal})}catch(e){if(e?.name==='AbortError')throw new Error('Tempo limite na comunicação com o SIVTR central.');throw e}finally{clearTimeout(t)}}
+function markRemoteOk(){remoteConnected=true;lastRemoteOk=Date.now();lastRemoteError='';updateNet()}
+function markRemoteFail(msg=''){remoteConnected=false;if(msg&&!/tempo limite|network|fetch|offline|aborted/i.test(String(msg)))lastRemoteError=String(msg);updateNet()}
+async function supabaseRpc(name,payload,timeout=12000){const r=await fetchTimeout(`${SUPABASE_URL}/rest/v1/rpc/${name}`,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE,'Cache-Control':'no-cache'},body:JSON.stringify(payload)},timeout);let d=null;try{d=await r.json()}catch{}if(!r.ok)throw new Error(d?.message||d?.error||`HTTP ${r.status}`);markRemoteOk();return d}
+function isTransientRemoteError(e){return /tempo limite|network|fetch|offline|aborted|load failed|internet|connection|conexão|failed to fetch/i.test(String(e?.message||e||''))}
 async function remoteMission(){
   let oldErr=null,d=null;
-  // A função original existe em todas as instalações do SIVTR. Ela é a primeira opção.
-  try{d=await supabaseRpc('sivtr_get_mission',{p_token:token})}
-  catch(e){oldErr=e}
+  try{d=await supabaseRpc('sivtr_get_mission',{p_token:token},10000)}catch(e){oldErr=e}
   if(d){d=Array.isArray(d)?d[0]:d;return d}
-  // Compatibilidade apenas para missões antigas cujo token já foi trocado por versões anteriores.
-  // Se a função v2 não existir no Supabase, a ficha NÃO quebra: mantém o ticket do QR.
+  if(oldErr&&!/missão não encontrada|mission not found/i.test(String(oldErr?.message||''))){markRemoteFail(oldErr?.message);throw oldErr}
   if(missionId){
-    try{d=await supabaseRpc('sivtr_get_mission_v2',{p_token:token,p_mission_id:missionId})}
+    try{d=await supabaseRpc('sivtr_get_mission_v2',{p_token:token,p_mission_id:missionId},10000)}
     catch(e){
       const msg=String(e?.message||'');
-      if(!/could not find the function|schema cache|p_mission_id|sivtr_get_mission_v2/i.test(msg)) throw (oldErr||e);
-      if(oldErr) throw oldErr;
-      return null;
+      if(/could not find the function|schema cache|p_mission_id|sivtr_get_mission_v2/i.test(msg)){if(oldErr)throw oldErr;return null}
+      markRemoteFail(msg);throw (oldErr||e)
     }
   }
   d=Array.isArray(d)?d[0]:d;
   return d||null;
 }
 async function send(kind,data,allowQueue=true){
-  if(!navigator.onLine){if(allowQueue){await queue(kind,data);return {ok:true,queuedLocal:true}}throw new Error('Sem internet. Ação aguardando sincronização.')}
+  if(!navigator.onLine){if(allowQueue){await queue(kind,data);markRemoteFail('offline');return {ok:true,queuedLocal:true}}throw new Error('Sem internet. Ação aguardando sincronização.')}
   if(externalMode){
-    // Primeiro usa a RPC original, disponível desde a primeira implantação.
-    try{return await supabaseRpc('sivtr_enqueue_action',{p_token:token,p_action_type:kind,p_payload:data||{}})}
-    catch(e1){
-      // Só tenta a v2 para recuperar missões antigas por ID.
-      if(missionId){
-        try{return await supabaseRpc('sivtr_enqueue_action_v2',{p_token:token,p_mission_id:missionId,p_action_type:kind,p_payload:data||{}})}
-        catch(e2){
-          const msg=String(e2?.message||e1?.message||'Falha de sincronização');
-          if(allowQueue&&/missão não encontrada|mission not found|404|function|schema cache/i.test(msg)){await queue(kind,data);lastRemoteError='Sincronização pendente; a ação foi preservada neste aparelho.';return {ok:true,queuedLocal:true}}
-          throw e2;
-        }
+    let last=null;
+    for(let attempt=0;attempt<3;attempt++){
+      try{return await supabaseRpc('sivtr_enqueue_action',{p_token:token,p_action_type:kind,p_payload:data||{}},12000)}
+      catch(e1){
+        last=e1;
+        const msg1=String(e1?.message||'');
+        if(/missão não encontrada|mission not found/i.test(msg1)&&missionId){
+          try{return await supabaseRpc('sivtr_enqueue_action_v2',{p_token:token,p_mission_id:missionId,p_action_type:kind,p_payload:data||{}},12000)}
+          catch(e2){last=e2;const msg2=String(e2?.message||'');if(!/could not find the function|schema cache|p_mission_id|sivtr_enqueue_action_v2/i.test(msg2)&&!isTransientRemoteError(e2))break}
+        }else if(!isTransientRemoteError(e1)&&!/404|function|schema cache/i.test(msg1))break;
+        if(attempt<2)await new Promise(r=>setTimeout(r,350*(attempt+1)));
       }
-      const msg=String(e1?.message||'Falha de sincronização');
-      if(allowQueue&&/missão não encontrada|mission not found|404|function|schema cache/i.test(msg)){await queue(kind,data);lastRemoteError='Sincronização pendente; a ação foi preservada neste aparelho.';return {ok:true,queuedLocal:true}}
-      throw e1;
     }
+    const msg=String(last?.message||'Falha de sincronização');
+    if(allowQueue){await queue(kind,data);markRemoteFail(msg);lastRemoteError='Ação preservada neste aparelho; sincronização automática em andamento.';return {ok:true,queuedLocal:true}}
+    throw last||new Error(msg);
   }
-  const r=await fetch(`/api/mobile/${encodeURIComponent(token)}/${kind}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});const d=await r.json();if(!r.ok||d.ok===false)throw new Error(d.error||'Falha');return d
+  const r=await fetchTimeout(`/api/mobile/${encodeURIComponent(token)}/${kind}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})},12000);const d=await r.json();if(!r.ok||d.ok===false)throw new Error(d.error||'Falha');return d
 }
 async function queue(kind,data){const item={id:crypto.randomUUID?crypto.randomUUID():Date.now()+'_'+Math.random(),kind,data,at:new Date().toISOString(),token};await put('queue',item);return item}
-async function flushQueue(){if(!navigator.onLine)return;for(const x of (await all('queue')).sort((a,b)=>a.at.localeCompare(b.at))){try{await send(x.kind,x.data,false);await del('queue',x.id)}catch{break}}}
+async function flushQueue(){if(flushBusy||!navigator.onLine)return;flushBusy=true;try{for(const x of (await all('queue')).sort((a,b)=>a.at.localeCompare(b.at))){try{await send(x.kind,x.data,false);await del('queue',x.id);markRemoteOk()}catch(e){markRemoteFail(e?.message);break}}}finally{flushBusy=false}}
 const vtrLabel=m=>[m.vehicle_code||m.vehicleCode,m.vehicle_type||m.vehicleType,m.fab_register||m.fabRegister].filter(Boolean).join(' - ');
 const statusOf=m=>String(m.status||'').toUpperCase();
 function hero(){return `<div class="card hero"><h1>${esc(mission.mission_number||mission.missionNumber||'MISSÃO')}</h1><span class="status">${esc(mission.status||'SINCRONIZANDO')}</span><div class="grid" style="margin-top:10px"><div class="cell"><small>VTR / TIPO / REG</small><b>${esc(vtrLabel(mission)||'-')}</b></div><div class="cell"><small>MOTORISTA / SARAM</small><b>${esc(mission.driver_display||mission.driver||'-')}${mission.driver_saram||mission.driverSaram?` / ${esc(mission.driver_saram||mission.driverSaram)}`:''}</b></div><div class="cell"><small>DESTINO</small><b>${esc(mission.destination||'-')}</b></div><div class="cell"><small>APRESENTAÇÃO</small><b>${esc(mission.presentation_place||mission.presentationPlace||mission.scheduled_departure||mission.departure||'-')}</b></div><div class="cell"><small>SOLICITANTE / SEÇÃO</small><b>${esc((mission.requester_name||mission.requester||'-')+' / '+(mission.requester_section||mission.section||'-'))}</b></div><div class="cell"><small>MISSÃO</small><b>${esc(mission.mission||'-')}</b></div></div></div>`}
@@ -92,8 +91,7 @@ window.captureShot=async(stage,key,input)=>{const f=input.files?.[0];if(!f)retur
 function compressImage(file){return new Promise((resolve,reject)=>{const img=new Image(),r=new FileReader();r.onload=()=>img.src=r.result;r.onerror=reject;img.onload=()=>{const max=1280,scale=Math.min(1,max/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=Math.round(img.width*scale);c.height=Math.round(img.height*scale);c.getContext('2d').drawImage(img,0,0,c.width,c.height);resolve(c.toDataURL('image/jpeg',.72))};r.readAsDataURL(file)})}
 function collectChecklist(stage){const o={};checklistItems.forEach((x,i)=>o[x]=document.querySelector(`input[name="ck_${stage}_${i}"]:checked`)?.value||'');return o}
 async function uploadShots(stage,submissionId){
-  let done=0;const tasks=requiredShots.map(async(x)=>{const st=shotState[stage][x.key];if(!st)throw new Error(`Falta a foto: ${x.label}`);const clientPhotoId=`${submissionId}:${stage}:${x.key}`;const r=await send('photo',{stage,caption:x.label,dataUrl:st.dataUrl,eventAt:st.capturedAt,clientPhotoId});done++;setSubmitProgress(`Fotos sincronizadas: ${done}/5`);return r});
-  const out=await Promise.all(tasks);setSubmitProgress('5/5 fotos registradas no envio.');return out;
+  const out=[];let done=0;for(const x of requiredShots){const st=shotState[stage][x.key];if(!st)throw new Error(`Falta a foto: ${x.label}`);const clientPhotoId=`${submissionId}:${stage}:${x.key}`;const r=await send('photo',{stage,caption:x.label,dataUrl:st.dataUrl,eventAt:st.capturedAt,clientPhotoId});out.push(r);done++;setSubmitProgress(`Fotos registradas para sincronização: ${done}/5`)}setSubmitProgress('5/5 fotos preservadas e em sincronização com o CDM.');return out;
 }
 function startForm(){return `<div class="card"><h2>Ficha de saída</h2><div class="form-block"><div class="field-km"><label>KM de saída</label><div class="input-unit"><input id="kmStart" type="number" inputmode="numeric" min="1"><span>KM</span></div></div><div class="fuel-block"><div class="section-label">Combustível na saída</div>${fuelPicker('fuelStart')}</div></div><h2 style="margin-top:16px">Checklist de saída</h2>${checklist('SAIDA')}<h2 style="margin-top:16px">Fotos obrigatórias</h2>${photos('SAÍDA')}<label>Observações</label><textarea id="startNotes"></textarea><button id="submitStartBtn" class="btn green" onclick="submitStart()">ENVIAR FICHA / SOLICITAR SAÍDA</button><div id="submitStartStatus" class="submit-status"></div></div>`}
 function waitCard(){return `<div class="card departure-wait"><div class="wait-icon">···</div><h2>AGUARDANDO AUTORIZAÇÃO DE SAÍDA</h2><div class="notice warn strong-notice">A VIATURA AINDA NÃO ESTÁ AUTORIZADA A SAIR DA ORGANIZAÇÃO.</div><div class="wait-steps"><span class="done">Ficha preenchida</span><span class="done">Solicitação registrada</span><span class="pending">Aguardando autorização</span></div><div id="submissionProgress" class="small sync-progress">${esc(submissionProgress||'Sincronizando dados com o CDM...')}</div>${photoSummary('SAÍDA')}<div class="small">Esta tela atualiza automaticamente quando o Despachante/Auxiliar autorizar a saída.</div></div>`}
@@ -110,7 +108,7 @@ window.submitOccurrence=async()=>{try{const desc=document.getElementById('occDes
 window.emergency=async()=>{if(!confirm('Acionar o Despachante como EMERGÊNCIA?'))return;try{let pos={};try{pos=await new Promise((res,rej)=>navigator.geolocation.getCurrentPosition(p=>res({latitude:p.coords.latitude,longitude:p.coords.longitude}),rej,{enableHighAccuracy:true,timeout:5000}))}catch{}await send('emergency',{...pos,eventAt:new Date().toISOString(),description:'Motorista acionou emergência pela ficha.'});alert('EMERGÊNCIA registrada e enviada ao CDM.')}catch(e){alert(e.message)}};
 function clearDraftFieldsOnly(){draft={};try{localStorage.removeItem(draftKey)}catch{}persistMobileState()}
 function clearDraft(){draft={};shotState.SAÍDA={};shotState.RETORNO={};try{localStorage.removeItem(draftKey)}catch{}persistMobileState()}
-async function refresh(){if(!token||token.length<16){app.innerHTML='<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Link da missão inválido ou sem token.</div></div>';return}if(!initializedState)await restoreMobileState();const cached=await get('missions',token).catch(()=>null),ticket=ticketFromHash();if(!mission){mission=cached?.data||ticket||null;if(mission)render()}try{const data=externalMode?await remoteMission():(await (async()=>{const r=await fetchTimeout('/api/mobile/mission/'+encodeURIComponent(token)+'?_='+Date.now(),{cache:'no-store'},5000),d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||`HTTP ${r.status}`);return d.data})());if(data){lastRemoteError='';mission=data;await put('missions',{token,data,at:new Date().toISOString()});render()}}catch(e){const raw=String(e?.message||'Falha de sincronização');lastRemoteError=/missão não encontrada|mission not found|schema cache|could not find the function/i.test(raw)?'Sincronização da missão pendente. Os dados do QR continuam disponíveis e o sistema tentará novamente automaticamente.':raw;if(mission)render();else app.innerHTML=`<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Não foi possível carregar a missão.</div><div class="small">${esc(lastRemoteError)}</div><button class="btn" onclick="refresh()">Tentar novamente</button></div>`}}
-async function backgroundRefresh(){if(!token)return;try{const data=externalMode?await remoteMission():null;if(data){const changed=!mission||mission.updated_at!==data.updated_at||mission.status!==data.status;mission=data;lastRemoteError='';await put('missions',{token,data,at:new Date().toISOString()});if(changed)render()}}catch(e){lastRemoteError=e?.message||'Falha de sincronização';if(!mission)render()}}
-if(!externalMode&&'serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
+async function refresh(){if(!token||token.length<16){app.innerHTML='<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Link da missão inválido ou sem token.</div></div>';return}if(!initializedState)await restoreMobileState();const cached=await get('missions',token).catch(()=>null),ticket=ticketFromHash();if(!mission){mission=cached?.data||ticket||null;if(mission)render()}if(remoteReadBusy)return;remoteReadBusy=true;try{const data=externalMode?await remoteMission():(await (async()=>{const r=await fetchTimeout('/api/mobile/mission/'+encodeURIComponent(token)+'?_='+Date.now(),{cache:'no-store'},8000),d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||`HTTP ${r.status}`);return d.data})());if(data){markRemoteOk();mission=data;await put('missions',{token,data,at:new Date().toISOString()});render()}}catch(e){const raw=String(e?.message||'Falha de sincronização');markRemoteFail(raw);lastRemoteError=/missão não encontrada|mission not found|schema cache|could not find the function/i.test(raw)?'Sincronização da missão pendente. Os dados do QR continuam disponíveis e o sistema tentará novamente automaticamente.':(isTransientRemoteError(e)?'Reconectando ao SIVTR central automaticamente.':raw);if(mission)render();else app.innerHTML=`<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Não foi possível carregar a missão.</div><div class="small">${esc(lastRemoteError)}</div><button class="btn" onclick="refresh()">Tentar novamente</button></div>`}finally{remoteReadBusy=false}}
+async function backgroundRefresh(){if(!token||remoteReadBusy)return;remoteReadBusy=true;try{const data=externalMode?await remoteMission():null;if(data){markRemoteOk();const changed=!mission||mission.updated_at!==data.updated_at||mission.status!==data.status||JSON.stringify(mission.media||[])!==JSON.stringify(data.media||[]);mission=data;await put('missions',{token,data,at:new Date().toISOString()});if(changed)render()}}catch(e){markRemoteFail(e?.message);if(!mission)render()}finally{remoteReadBusy=false}}
+if(!externalMode&&'serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js?v=680').catch(()=>{});
 refresh().then(flushQueue);setInterval(()=>{flushQueue();backgroundRefresh()},1000);
