@@ -2,7 +2,7 @@ const app=document.getElementById('app'),net=document.getElementById('net');
 const SUPABASE_URL='https://xbefmjcagmlqptkrrtse.supabase.co';
 const SUPABASE_PUBLISHABLE='sb_publishable_J7wi8MGYRKcVCE7fQRsMxg_bPtEd44e';
 const qs=new URLSearchParams(location.search);
-function bootTicket(){try{const h=new URLSearchParams(location.hash.replace(/^#/,'')),b=h.get('ticket');if(!b)return null;const z=b.replace(/-/g,'+').replace(/_/g,'/');return JSON.parse(decodeURIComponent(escape(atob(z+'==='.slice((z.length+3)%4)))))}catch{return null}}
+function bootTicket(){try{const h=new URLSearchParams(location.hash.replace(/^#/,'')),b=h.get('ticket');if(!b)return null;let z=String(b).replace(/-/g,'+').replace(/_/g,'/');z+='='.repeat((4-(z.length%4))%4);const bin=atob(z);const bytes=Uint8Array.from(bin,c=>c.charCodeAt(0));return JSON.parse(new TextDecoder('utf-8').decode(bytes))}catch{return null}}
 const boot=bootTicket();
 const pathPart=location.pathname.split('/').filter(Boolean).pop()||'';
 const qrToken=decodeURIComponent(qs.get('token')||boot?.token||((pathPart&&pathPart!=='ficha'&&pathPart!=='index.html')?pathPart:'')||'');
@@ -32,24 +32,43 @@ function restoreDraftToDom(){for(const [k,v] of Object.entries(draft)){const el=
 async function fetchTimeout(url,opt={},ms=7000){const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),ms);try{return await fetch(url,{...opt,signal:ctrl.signal})}finally{clearTimeout(t)}}
 async function supabaseRpc(name,payload){const r=await fetchTimeout(`${SUPABASE_URL}/rest/v1/rpc/${name}`,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE},body:JSON.stringify(payload)},7000);let d=null;try{d=await r.json()}catch{}if(!r.ok)throw new Error(d?.message||d?.error||`HTTP ${r.status}`);return d}
 async function remoteMission(){
-  let firstErr=null,d=null;
-  try{d=await supabaseRpc('sivtr_get_mission_v2',{p_token:token,p_mission_id:missionId||null})}
-  catch(e){firstErr=e;try{d=await supabaseRpc('sivtr_get_mission',{p_token:token})}catch(e2){throw e2}}
+  let oldErr=null,d=null;
+  // A função original existe em todas as instalações do SIVTR. Ela é a primeira opção.
+  try{d=await supabaseRpc('sivtr_get_mission',{p_token:token})}
+  catch(e){oldErr=e}
+  if(d){d=Array.isArray(d)?d[0]:d;return d}
+  // Compatibilidade apenas para missões antigas cujo token já foi trocado por versões anteriores.
+  // Se a função v2 não existir no Supabase, a ficha NÃO quebra: mantém o ticket do QR.
+  if(missionId){
+    try{d=await supabaseRpc('sivtr_get_mission_v2',{p_token:token,p_mission_id:missionId})}
+    catch(e){
+      const msg=String(e?.message||'');
+      if(!/could not find the function|schema cache|p_mission_id|sivtr_get_mission_v2/i.test(msg)) throw (oldErr||e);
+      if(oldErr) throw oldErr;
+      return null;
+    }
+  }
   d=Array.isArray(d)?d[0]:d;
-  // O token lido do QR é imutável durante toda a missão. Nunca o substitua por retorno remoto.
-  return d;
+  return d||null;
 }
 async function send(kind,data,allowQueue=true){
   if(!navigator.onLine){if(allowQueue){await queue(kind,data);return {ok:true,queuedLocal:true}}throw new Error('Sem internet. Ação aguardando sincronização.')}
   if(externalMode){
-    try{return await supabaseRpc('sivtr_enqueue_action_v2',{p_token:token,p_mission_id:missionId||null,p_action_type:kind,p_payload:data||{}})}
+    // Primeiro usa a RPC original, disponível desde a primeira implantação.
+    try{return await supabaseRpc('sivtr_enqueue_action',{p_token:token,p_action_type:kind,p_payload:data||{}})}
     catch(e1){
-      try{return await supabaseRpc('sivtr_enqueue_action',{p_token:token,p_action_type:kind,p_payload:data||{}})}
-      catch(e2){
-        const msg=String(e2?.message||e1?.message||'Falha de sincronização');
-        if(allowQueue&&/missão não encontrada|mission not found|404|function/i.test(msg)){await queue(kind,data);lastRemoteError='Sincronização pendente; a ação foi preservada neste aparelho.';return {ok:true,queuedLocal:true}}
-        throw e2;
+      // Só tenta a v2 para recuperar missões antigas por ID.
+      if(missionId){
+        try{return await supabaseRpc('sivtr_enqueue_action_v2',{p_token:token,p_mission_id:missionId,p_action_type:kind,p_payload:data||{}})}
+        catch(e2){
+          const msg=String(e2?.message||e1?.message||'Falha de sincronização');
+          if(allowQueue&&/missão não encontrada|mission not found|404|function|schema cache/i.test(msg)){await queue(kind,data);lastRemoteError='Sincronização pendente; a ação foi preservada neste aparelho.';return {ok:true,queuedLocal:true}}
+          throw e2;
+        }
       }
+      const msg=String(e1?.message||'Falha de sincronização');
+      if(allowQueue&&/missão não encontrada|mission not found|404|function|schema cache/i.test(msg)){await queue(kind,data);lastRemoteError='Sincronização pendente; a ação foi preservada neste aparelho.';return {ok:true,queuedLocal:true}}
+      throw e1;
     }
   }
   const r=await fetch(`/api/mobile/${encodeURIComponent(token)}/${kind}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});const d=await r.json();if(!r.ok||d.ok===false)throw new Error(d.error||'Falha');return d
@@ -81,7 +100,7 @@ window.submitReturn=async()=>{try{const km=Number(document.getElementById('kmEnd
 window.submitOccurrence=async()=>{try{const desc=document.getElementById('occDesc').value.trim();if(!desc)throw new Error('Descreva a ocorrência.');await send('occurrence',{occurrenceType:document.getElementById('occType').value,description:desc,eventAt:new Date().toISOString()});document.getElementById('occDesc').value='';alert('Ocorrência enviada ao CDM e à manutenção.')}catch(e){alert(e.message)}};
 window.emergency=async()=>{if(!confirm('Acionar o Despachante como EMERGÊNCIA?'))return;try{let pos={};try{pos=await new Promise((res,rej)=>navigator.geolocation.getCurrentPosition(p=>res({latitude:p.coords.latitude,longitude:p.coords.longitude}),rej,{enableHighAccuracy:true,timeout:5000}))}catch{}await send('emergency',{...pos,eventAt:new Date().toISOString(),description:'Motorista acionou emergência pela ficha.'});alert('EMERGÊNCIA registrada e enviada ao CDM.')}catch(e){alert(e.message)}};
 function clearDraft(){draft={};try{localStorage.removeItem(draftKey)}catch{}persistMobileState()}
-async function refresh(){if(!token||token.length<16){app.innerHTML='<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Link da missão inválido ou sem token.</div></div>';return}if(!initializedState)await restoreMobileState();const cached=await get('missions',token).catch(()=>null),ticket=ticketFromHash();if(!mission){mission=cached?.data||ticket||null;if(mission)render()}try{const data=externalMode?await remoteMission():(await (async()=>{const r=await fetchTimeout('/api/mobile/mission/'+encodeURIComponent(token)+'?_='+Date.now(),{cache:'no-store'},5000),d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||`HTTP ${r.status}`);return d.data})());if(data){lastRemoteError='';mission=data;await put('missions',{token,data,at:new Date().toISOString()});render()}}catch(e){lastRemoteError=e?.message||'Falha de sincronização';if(mission)render();else app.innerHTML=`<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Não foi possível carregar a missão.</div><div class="small">${esc(lastRemoteError)}</div><button class="btn" onclick="refresh()">Tentar novamente</button></div>`}}
+async function refresh(){if(!token||token.length<16){app.innerHTML='<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Link da missão inválido ou sem token.</div></div>';return}if(!initializedState)await restoreMobileState();const cached=await get('missions',token).catch(()=>null),ticket=ticketFromHash();if(!mission){mission=cached?.data||ticket||null;if(mission)render()}try{const data=externalMode?await remoteMission():(await (async()=>{const r=await fetchTimeout('/api/mobile/mission/'+encodeURIComponent(token)+'?_='+Date.now(),{cache:'no-store'},5000),d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||`HTTP ${r.status}`);return d.data})());if(data){lastRemoteError='';mission=data;await put('missions',{token,data,at:new Date().toISOString()});render()}}catch(e){const raw=String(e?.message||'Falha de sincronização');lastRemoteError=/missão não encontrada|mission not found|schema cache|could not find the function/i.test(raw)?'Sincronização da missão pendente. Os dados do QR continuam disponíveis e o sistema tentará novamente automaticamente.':raw;if(mission)render();else app.innerHTML=`<div class="card"><h2>Ficha da missão</h2><div class="notice warn">Não foi possível carregar a missão.</div><div class="small">${esc(lastRemoteError)}</div><button class="btn" onclick="refresh()">Tentar novamente</button></div>`}}
 async function backgroundRefresh(){if(!token)return;try{const data=externalMode?await remoteMission():null;if(data){const changed=!mission||mission.updated_at!==data.updated_at||mission.status!==data.status;mission=data;lastRemoteError='';await put('missions',{token,data,at:new Date().toISOString()});if(changed)render()}}catch(e){lastRemoteError=e?.message||'Falha de sincronização';if(!mission)render()}}
 if(!externalMode&&'serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 refresh().then(flushQueue);setInterval(()=>{flushQueue();backgroundRefresh()},1500);
