@@ -34,7 +34,7 @@ async function supabaseRpc(name,payload){const r=await fetchTimeout(`${SUPABASE_
 async function remoteMission(){
   let firstErr=null,d=null;
   try{d=await supabaseRpc('sivtr_get_mission_v2',{p_token:token,p_mission_id:missionId||null})}
-  catch(e){firstErr=e;try{d=await supabaseRpc('sivtr_get_mission',{p_token:token})}catch(e2){throw firstErr||e2}}
+  catch(e){firstErr=e;try{d=await supabaseRpc('sivtr_get_mission',{p_token:token})}catch(e2){throw e2}}
   d=Array.isArray(d)?d[0]:d;
   // O token lido do QR é imutável durante toda a missão. Nunca o substitua por retorno remoto.
   return d;
